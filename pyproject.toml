@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mudrarecord"
+version = "0.1.0"
+description = "Mudra Band Recorder - fast raw-channel recording (CSV / LSL) for the Mudra Band"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["mudra", "ble", "bluetooth", "wearable", "emg", "semg", "lsl", "recording"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+    "Topic :: Scientific/Engineering :: Human Machine Interfaces",
+]
+dependencies = [
+    "bleak>=0.21.0",
+]
+
+[project.optional-dependencies]
+lsl = ["pylsl>=1.16"]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+mudrarecord = "mudrarecord.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mudrarecord"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
