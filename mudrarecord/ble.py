@@ -164,8 +164,10 @@ class BleConnection:
         self._handlers[char_uuid] = handler
 
     async def start_notify(self, char_uuid: str) -> None:
-        """Subscribe to notifications on a characteristic."""
+        """Subscribe to notifications on a characteristic (idempotent)."""
         assert self._client is not None
+        if char_uuid in self._subscribed:
+            return
         cb = lambda _sender, data, uuid=char_uuid: self._dispatch(uuid, data)
         try:
             await self._client.start_notify(char_uuid, cb)

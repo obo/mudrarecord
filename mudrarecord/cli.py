@@ -203,10 +203,11 @@ async def _cmd_stream(args, mode: str) -> None:
     # Enable only the requested channels. Skipping channels reduces the BLE
     # bandwidth the firmware spends, which can raise the effective rate of the
     # channels that remain.
-    if record_snc:
-        await device.enable_snc()
-        await asyncio.sleep(0.1)
-        await device.start_snc_notify()
+    #
+    # Order matters: enable the IMU stream BEFORE SNC. If SNC is enabled first
+    # it immediately floods the BLE link, and the subsequent IMU enable/subscribe
+    # is frequently lost so the accelerometer never starts (the "acc fully
+    # missing" symptom). Bringing IMU up first lets both streams establish.
     if record_imu:
         if record_acc:
             await device.enable_imu_acc()
@@ -215,6 +216,11 @@ async def _cmd_stream(args, mode: str) -> None:
             await device.enable_imu_gyro()
             await asyncio.sleep(0.1)
         await device.start_imu_notify()
+        await asyncio.sleep(0.1)
+    if record_snc:
+        await device.enable_snc()
+        await asyncio.sleep(0.1)
+        await device.start_snc_notify()
 
     await asyncio.sleep(0.2)
     await device.refresh_status()
@@ -232,8 +238,11 @@ async def _cmd_stream(args, mode: str) -> None:
     stop_event = asyncio.Event()
 
     disk_full = {"flag": False}
+    # Monotonic time of the last packet seen per stream (for the watchdog).
+    last_seen = {"snc": 0.0, "imu": 0.0}
 
     def emit(stream: str, ts_ns: int, raw: bytes) -> None:
+        last_seen[stream] = loop.time()
         if not decimator.accept(stream):
             return
         try:
@@ -272,11 +281,47 @@ async def _cmd_stream(args, mode: str) -> None:
     if s.is_gesture_to_hid_enabled or s.is_nav_to_hid_enabled:
         print("Warning: device still reports HID routing enabled.", file=sys.stderr)
 
+    # Watchdog: the band occasionally drops a stream (a lost enable command
+    # while it is waking up, or a stall after the LED-sleep cycle), which shows
+    # up as a channel that is "fully missing". If a requested stream produces no
+    # packets for WATCHDOG_TIMEOUT seconds, re-send its enable command and
+    # re-subscribe so recording recovers on its own.
+    WATCHDOG_TIMEOUT = 2.0
+    now0 = loop.time()
+    for st in last_seen:
+        last_seen[st] = now0
+
+    async def watchdog() -> None:
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+            if not device.is_connected:
+                continue
+            now = loop.time()
+            try:
+                if record_snc and now - last_seen["snc"] > WATCHDOG_TIMEOUT:
+                    print("Watchdog: SNC stream silent, re-enabling.", file=sys.stderr)
+                    await device.enable_snc()
+                    await device.start_snc_notify()
+                    last_seen["snc"] = now
+                if record_imu and now - last_seen["imu"] > WATCHDOG_TIMEOUT:
+                    print("Watchdog: IMU stream silent, re-enabling.", file=sys.stderr)
+                    if record_acc:
+                        await device.enable_imu_acc()
+                    if record_gyro:
+                        await device.enable_imu_gyro()
+                    await device.start_imu_notify()
+                    last_seen["imu"] = now
+            except Exception as e:
+                print(f"Watchdog re-enable failed: {e}", file=sys.stderr)
+
+    wd_task = loop.create_task(watchdog())
+
     try:
         await stop_event.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        wd_task.cancel()
         await _shutdown(device, sink, args, record_snc, record_acc, record_gyro)
 
 

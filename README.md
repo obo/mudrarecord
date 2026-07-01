@@ -319,6 +319,17 @@ packet bytes preserved alongside the decoded values.
   channels. Samples expanded from the same BLE packet share that packet's
   arrival timestamp.
 
+- **Why the accelerometer can be "fully missing", and how it is handled.** The
+  SNC and IMU streams share one BLE link. If SNC is enabled first it immediately
+  floods the link and the subsequent IMU enable/subscribe is frequently lost, so
+  the accelerometer never starts for that whole session. mudrarecord avoids this
+  by bringing the **IMU stream up before SNC**. Stale BLE state left over from a
+  previous session, or the band's LED-sleep/wake cycle, can also stall a stream
+  mid-recording. As a safety net a watchdog re-sends the enable command and
+  re-subscribes for any requested stream that produces no packets for ~2 s (it
+  prints a note to stderr when it does). If you still see a missing stream,
+  start from a clean connection (see the fresh-start recipe above).
+
 ## Architecture
 
 ```
