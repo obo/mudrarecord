@@ -11,8 +11,11 @@ prevented from acting as a mouse or keyboard.
 ## Features
 
 - Single CLI tool with four commands: `scan`, `info`, `stream-csv`, `stream-lsl`.
-- Records the raw channels the band provides: **SNC** (sEMG) and the **IMU**
-  packet (decoded **accelerometer**; raw **gyroscope** bytes preserved).
+- Records the band's raw channels as **real decoded float values**: the three
+  **SNC** (sEMG) nerve channels with per-packet **RMS**, and the **IMU**
+  accelerometer (raw gyroscope bytes available on request).
+- Output is primarily decoded floats; the verbatim packet bytes are added only
+  with `--include-raw-bytes`.
 - Exact global timestamps to the nanosecond (`time.time_ns()` captured at BLE
   packet arrival), in both CSV and LSL.
 - HID is turned **off** during recording: the band does not send mouse/keyboard
@@ -171,17 +174,20 @@ one.
 mudrarecord scan                         # find nearby bands
 mudrarecord info                         # connect and print device + channel state
 
-# Record everything (SNC + acc + gyro) to a CSV file at the device's max rate:
+# Record only the three SNC (sEMG) nerve channels + RMS to a CSV file:
+mudrarecord stream-csv --skip-acc --skip-gyro -o emg.csv
+
+# Record everything (SNC + accelerometer) at the device's max rate:
 mudrarecord stream-csv -o recording.csv
+
+# Also keep the verbatim packet bytes (adds a raw_hex column):
+mudrarecord stream-csv --include-raw-bytes -o with_raw.csv
 
 # Stream to stdout (pipe it somewhere):
 mudrarecord stream-csv -o - | your_consumer
 
 # Publish over LSL for MNE-Python / OpenViBE:
 mudrarecord stream-lsl
-
-# Record only SNC, skipping the IMU entirely:
-mudrarecord stream-csv --skip-acc --skip-gyro -o emg.csv
 
 # Keep 1 of every 4 samples (host-side decimation):
 mudrarecord stream-csv --rate 4 -o decimated.csv
@@ -206,7 +212,9 @@ gesture→HID back on when you stop.
 | `--skip-gyro`    | Do not record the gyroscope (see IMU packet note below).            |
 | `--restore-hid`  | Re-enable gesture→HID output on exit.                               |
 
-`stream-csv` additionally has `-o/--output` (file path or `-` for stdout).
+`stream-csv` additionally has `-o/--output` (file path or `-` for stdout) and
+`--include-raw-bytes` (add a verbatim `raw_hex` column; off by default so the
+CSV contains only decoded values).
 
 Accelerometer and gyroscope are delivered together in a single IMU packet, so
 the IMU stream is only disabled — freeing BLE bandwidth for the remaining
@@ -216,25 +224,31 @@ channels — when **both** `--skip-acc` and `--skip-gyro` are given.
 
 ### CSV
 
-One row per decoded sample. Columns:
+The CSV contains **primarily real decoded values (floats)**. One row per decoded
+sample. Columns (the `raw_hex` column is present only with
+`--include-raw-bytes`):
 
 ```
-timestamp_ns, timestamp_iso, stream, raw_hex, snc, ax, ay, az
+timestamp_ns, timestamp_iso, stream, [raw_hex,] snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az
 ```
 
 - `timestamp_ns` — global wall-clock time in nanoseconds since the Unix epoch,
   captured when the BLE packet arrived.
 - `timestamp_iso` — the same instant as ISO-8601 UTC with nanosecond precision.
 - `stream` — `snc` or `imu`.
-- `raw_hex` — the raw BLE payload, verbatim (authoritative; also carries the
-  raw gyroscope bytes, which are not decoded into columns).
-- `snc` — decoded sEMG value (filled only on `snc` rows).
+- `raw_hex` — (only with `--include-raw-bytes`) the verbatim BLE payload.
+- `snc1, snc2, snc3` — the three sEMG nerve channels (filled only on `snc`
+  rows). A clipped / no-contact sample is written as `nan`.
+- `rms1, rms2, rms3` — per-packet RMS of each SNC channel (see below).
 - `ax, ay, az` — decoded int16 accelerometer axes (filled only on `imu` rows).
 
-Columns not relevant to a given row's `stream` are left empty. A single IMU BLE
-packet contains several accelerometer samples; each becomes its own row (sharing
-that packet's timestamp and `raw_hex`). Likewise each SNC value in a packet
-becomes its own row.
+Columns not relevant to a given row's `stream` are left empty.
+
+A single SNC BLE packet carries a batch of 18 samples of all three channels
+(the channels are interleaved in the packet). mudrarecord **linearizes** this
+into one row per sample. The RMS values are only available once per packet, so
+the same `rms1/rms2/rms3` triple is repeated on every row that came from that
+packet. Likewise each accelerometer sample in an IMU packet becomes its own row.
 
 Diagnostic/status messages are written to **stderr**, so `stdout` carries clean
 CSV when you use `-o -`.
@@ -243,9 +257,11 @@ CSV when you use `-o -`.
 
 Up to two outlets are created as data arrives:
 
-- `Mudra-SNC` — type `EMG`, one `float32` channel labelled `snc`.
+- `Mudra-SNC` — type `EMG`, six `float32` channels labelled
+  `snc1, snc2, snc3, rms1, rms2, rms3` (the three nerve signals plus their
+  per-packet RMS).
 - `Mudra-IMU` — type `Motion`, three `float32` channels labelled `ax, ay, az`
-  (accelerometer). Gyroscope is not published over LSL (use CSV `raw_hex`).
+  (accelerometer). Gyroscope is not published over LSL.
 
 Each sample is pushed with its exact wall-clock timestamp (converted to LSL
 seconds), and channel labels are written into the stream metadata so MNE-Python
@@ -260,8 +276,23 @@ stream.
 
 These reflect what has been reverse-engineered from the band's raw BLE streams
 (observed on firmware 6.0.11.5). They are documented here so the recorded data
-is interpreted correctly. In all cases the verbatim `raw_hex` column is the
-authoritative record.
+is interpreted correctly. Add `--include-raw-bytes` if you want the verbatim
+packet bytes preserved alongside the decoded values.
+
+- **The three SNC (sEMG) channels are the main signal.** A 112-byte SNC packet
+  is 56 int16 little-endian values: indices 0..53 are 18 samples of three
+  interleaved channels (`snc1, snc2, snc3` — the three nerve electrodes), and
+  the last two values are a non-sensor footer. Deinterleaving by `index % 3`
+  yields three smooth oscillating sEMG waveforms. The extreme values `-32768`
+  and `+32767` are clip/invalid sentinels the firmware emits when a channel is
+  railed or an electrode has poor contact; mudrarecord reports these as `nan`.
+  This layout was reverse-engineered (the vendor decoder is closed-source with
+  no Linux build), so treat the exact scaling/units as best-effort.
+
+- **RMS is computed, not transmitted.** The device does not send RMS values;
+  the vendor SDK derives them. mudrarecord computes, per packet and per channel,
+  the root-mean-square over that packet's valid (non-`nan`) samples, and emits
+  it in `rms1/rms2/rms3`.
 
 - **Accelerometer is verified.** The IMU packet (type byte `0x04`) carries 8
   accelerometer samples as int16 little-endian `(ax, ay, az)` triplets; these
@@ -269,16 +300,10 @@ authoritative record.
 
 - **Gyroscope is not decoded.** The same IMU packet also carries a gyroscope
   block whose byte layout is not reliably understood, so `mudrarecord` does not
-  turn it into columns. Its raw bytes are preserved in the IMU `raw_hex` if you
-  want to decode it yourself. Because acc and gyro share one packet, they cannot
-  be recorded independently; the IMU stream is only fully disabled when both
-  `--skip-acc` and `--skip-gyro` are set.
-
-- **SNC decoding is experimental.** The sEMG samples are extracted as the int16
-  value preceding each `00 80` marker in the SNC packet (type byte `0x2e`),
-  which yields a clean oscillating waveform. However the exact channel count and
-  scaling are not officially documented, so treat the `snc` column as
-  experimental and rely on `raw_hex` for anything authoritative.
+  turn it into columns. Its raw bytes are available via `--include-raw-bytes`.
+  Because acc and gyro share one packet, they cannot be recorded independently;
+  the IMU stream is only fully disabled when both `--skip-acc` and `--skip-gyro`
+  are set.
 
 - **No firmware "sample rate" knob.** The device pushes BLE notifications at its
   own native (maximum) rate; there is no documented command to set a target Hz.

@@ -42,6 +42,19 @@ def _imu_packet(acc_samples, gyro_floats):
     return bytes(buf)
 
 
+def _snc_packet(rows):
+    """Build a 112-byte SNC packet from a list of [c1,c2,c3] int rows (18)."""
+    from mudrarecord import protocol
+
+    vals = []
+    for r in rows:
+        vals += list(r)
+    while len(vals) < protocol.SNC_DATA_INT16:
+        vals.append(protocol.SNC_CLIP_MAX)
+    vals += [0, 0]  # footer
+    return struct.pack("<%dh" % len(vals), *vals)
+
+
 def test_decode_samples_imu_expands_per_sample():
     pkt = _imu_packet([(1, 2, 3), (4, 5, 6)], [0.5, 0.25])
     out = decode_samples("imu", pkt)
@@ -49,14 +62,19 @@ def test_decode_samples_imu_expands_per_sample():
     assert out[1] == [4, 5, 6]
 
 
-def test_decode_samples_snc_one_row_per_value():
-    from mudrarecord import protocol
-
-    buf = bytearray([0x2E, 0xFF])
-    for v in (100, -200, 300):
-        buf += struct.pack("<h", v) + protocol.SNC_MARKER
-    out = decode_samples("snc", bytes(buf))
-    assert out == [[100], [-200], [300]]
+def test_decode_samples_snc_channels_and_rms():
+    # Two samples of 3 channels, rest padded with clip sentinel.
+    pkt = _snc_packet([[3, 4, 0], [0, 0, 0]] + [[32767, 32767, 32767]] * 16)
+    out = decode_samples("snc", pkt)
+    # 18 rows (one per interleaved sample); each row has 3 channels + 3 rms.
+    assert len(out) == 18
+    assert out[0][:3] == [3.0, 4.0, 0.0]
+    # rms1 over valid ch0 values {3, 0, ...clipped ignored} = sqrt((9+0)/2)
+    import math
+    rms1 = out[0][3]
+    assert math.isclose(rms1, math.sqrt((9 + 0) / 2), rel_tol=1e-6)
+    # Every row carries the same per-packet RMS triple.
+    assert out[5][3:] == out[0][3:]
 
 
 def test_csv_sink_header_and_imu_row(tmp_path):
@@ -68,25 +86,38 @@ def test_csv_sink_header_and_imu_row(tmp_path):
 
     lines = path.read_text().strip().splitlines()
     assert lines[0].split(",") == [
-        "timestamp_ns", "timestamp_iso", "stream", "raw_hex",
-        "snc", "ax", "ay", "az",
+        "timestamp_ns", "timestamp_iso", "stream",
+        "snc1", "snc2", "snc3", "rms1", "rms2", "rms3", "ax", "ay", "az",
     ]
     row = lines[1].split(",")
     assert row[0] == "42"
     assert row[2] == "imu"
-    assert row[3] == "0402"
-    assert row[4] == ""          # snc column empty for imu row
-    assert row[5:8] == ["1", "2", "3"]
+    # No raw_hex column by default.
+    assert row[3:9] == ["", "", "", "", "", ""]  # snc + rms empty
+    assert row[9:12] == ["1", "2", "3"]          # ax, ay, az
     assert sink.count == 1
 
 
-def test_csv_sink_snc_row_only_fills_snc_column(tmp_path):
+def test_csv_sink_snc_row(tmp_path):
     path = tmp_path / "snc.csv"
     sink = CSVSink(str(path), flush_every=1)
     sink.open()
-    sink.write("snc", 7, b"\x2e\xff", [471])
+    sink.write("snc", 7, b"\x2e\xff", [471.0, 12.0, -3.0, 100.0, 5.0, 2.0])
     sink.close()
     row = path.read_text().strip().splitlines()[1].split(",")
     assert row[2] == "snc"
-    assert row[4] == "471"        # snc column
-    assert row[5:] == ["", "", ""]  # imu columns empty
+    assert row[3:6] == ["471.0", "12.0", "-3.0"]   # snc1..3
+    assert row[6:9] == ["100.0", "5.0", "2.0"]     # rms1..3
+    assert row[9:] == ["", "", ""]                 # imu columns empty
+
+
+def test_csv_sink_include_raw_bytes(tmp_path):
+    path = tmp_path / "raw.csv"
+    sink = CSVSink(str(path), flush_every=1, include_raw=True)
+    sink.open()
+    sink.write("imu", 1, b"\xab\xcd", [1, 2, 3])
+    sink.close()
+    lines = path.read_text().strip().splitlines()
+    assert lines[0].split(",")[3] == "raw_hex"
+    row = lines[1].split(",")
+    assert row[3] == "abcd"

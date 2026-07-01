@@ -1,4 +1,4 @@
-"""Output sinks for raw Mudra Band data: CSV and LSL.
+"""Output sinks for Mudra Band data: CSV and LSL.
 
 Design goals:
 
@@ -11,32 +11,36 @@ Design goals:
   ``time.time_ns()`` captured when its BLE packet arrived, plus a nanosecond
   ISO-8601 UTC string in the CSV.
 
-Channel layout per stream (fixed so CSV columns are stable):
+Output is *primarily real decoded values* (floats). The verbatim raw packet
+bytes are only included when explicitly requested (``include_raw=True`` /
+``--include-raw-bytes``).
 
-* ``snc``: raw hex plus a best-effort little-endian int16 decode
-  (``SNC_DECODED_CHANNELS`` values, zero-padded / truncated). EXPERIMENTAL.
-* ``imu``: raw hex plus decoded ``ax, ay, az, gx, gy, gz`` (int16).
+Decoded channel layout per stream (fixed so CSV columns are stable):
 
-The IMU stream may be accelerometer, gyroscope, or (when both are enabled) an
-undifferentiated mix; see ``protocol`` module notes.
+* ``snc``: the three sEMG channels ``snc1, snc2, snc3`` plus the per-packet
+  RMS of each channel ``rms1, rms2, rms3``. One BLE packet contains a batch of
+  samples; the packet is linearized into one row per sample, and the packet's
+  RMS triple is repeated on every row of that packet.
+* ``imu``: the accelerometer axes ``ax, ay, az`` (int16). The gyroscope portion
+  of the IMU packet is not decoded; enable ``include_raw`` to keep its bytes.
 """
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import sys
 from typing import Optional, TextIO
 
 from . import protocol
 
-# Decoded channel layout per stream.
-#   snc: one experimental sEMG int16 value per sample.
-#   imu: ax, ay, az (int16, verified accelerometer).
-# The gyroscope portion of the IMU packet is retained verbatim in raw_hex but
-# is NOT decoded into columns: its byte layout is not reliably understood.
-SNC_DECODED_CHANNELS = 1
-IMU_DECODED_CHANNELS = 3  # ax, ay, az
-SNC_LABELS = ["snc"]
-IMU_LABELS = ["ax", "ay", "az"]
+# CSV value columns (floats), in fixed order across all rows.
+SNC_COLUMNS = ["snc1", "snc2", "snc3", "rms1", "rms2", "rms3"]
+IMU_COLUMNS = ["ax", "ay", "az"]
+VALUE_COLUMNS = SNC_COLUMNS + IMU_COLUMNS
+
+# LSL channel layouts.
+SNC_LSL_CHANNELS = 6  # snc1, snc2, snc3, rms1, rms2, rms3
+IMU_LSL_CHANNELS = 3  # ax, ay, az
 
 
 def _iso_ns(ts_ns: int) -> str:
@@ -44,6 +48,15 @@ def _iso_ns(ts_ns: int) -> str:
     secs, ns = divmod(ts_ns, 1_000_000_000)
     dt = _dt.datetime.fromtimestamp(secs, tz=_dt.timezone.utc)
     return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{ns:09d}Z"
+
+
+def _fmt(v) -> str:
+    """Format a decoded channel value compactly for CSV."""
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "nan"
+        return repr(v)
+    return str(v)
 
 
 class Decimator:
@@ -67,31 +80,31 @@ class Decimator:
 class CSVSink:
     """Streams one CSV row per decoded sample to a file or stdout.
 
-    Columns:
-        timestamp_ns, timestamp_iso, stream, raw_hex, snc, ax, ay, az
+    Columns (raw_hex only present when ``include_raw`` is set)::
+
+        timestamp_ns, timestamp_iso, stream, [raw_hex,]
+        snc1, snc2, snc3, rms1, rms2, rms3, ax, ay, az
 
     Each row fills only the columns relevant to its ``stream`` (``snc`` or
-    ``imu``); the others are left empty. ``raw_hex`` always holds the verbatim
-    BLE payload and is the authoritative record (it also carries the raw
-    gyroscope bytes, which are not decoded into columns).
+    ``imu``); the others are left empty.
     """
 
-    # Decoded value columns, in order. Each sample maps its channels onto a
-    # subset of these named columns.
-    VALUE_COLUMNS = ["snc", "ax", "ay", "az"]
     _STREAM_COLUMNS = {
-        "snc": ["snc"],
-        "imu": ["ax", "ay", "az"],
+        "snc": SNC_COLUMNS,
+        "imu": IMU_COLUMNS,
     }
 
-    def __init__(self, path: Optional[str], flush_every: int = 200) -> None:
+    def __init__(
+        self, path: Optional[str], flush_every: int = 200, include_raw: bool = False
+    ) -> None:
         self._path = path
         self._flush_every = max(1, flush_every)
+        self._include_raw = include_raw
         self._fh: Optional[TextIO] = None
         self._owns_fh = False
         self._since_flush = 0
         self.count = 0
-        self._col_index = {c: i for i, c in enumerate(self.VALUE_COLUMNS)}
+        self._col_index = {c: i for i, c in enumerate(VALUE_COLUMNS)}
 
     def open(self) -> None:
         if self._path in (None, "-"):
@@ -102,16 +115,21 @@ class CSVSink:
             # for hours of continuous recording.
             self._fh = open(self._path, "w", buffering=1 << 20, newline="")
             self._owns_fh = True
-        header = ["timestamp_ns", "timestamp_iso", "stream", "raw_hex"]
-        header += self.VALUE_COLUMNS
+        header = ["timestamp_ns", "timestamp_iso", "stream"]
+        if self._include_raw:
+            header.append("raw_hex")
+        header += VALUE_COLUMNS
         self._fh.write(",".join(header) + "\n")
 
     def write(self, stream: str, ts_ns: int, raw: bytes, channels: list) -> None:
         assert self._fh is not None
-        values = [""] * len(self.VALUE_COLUMNS)
+        values = [""] * len(VALUE_COLUMNS)
         for col, val in zip(self._STREAM_COLUMNS.get(stream, []), channels):
             values[self._col_index[col]] = _fmt(val)
-        row = [str(ts_ns), _iso_ns(ts_ns), stream, raw.hex(), *values]
+        row = [str(ts_ns), _iso_ns(ts_ns), stream]
+        if self._include_raw:
+            row.append(raw.hex())
+        row += values
         self._fh.write(",".join(row))
         self._fh.write("\n")
         self.count += 1
@@ -131,28 +149,20 @@ class CSVSink:
             self._fh = None
 
 
-def _fmt(v) -> str:
-    """Format a decoded channel value compactly for CSV."""
-    if isinstance(v, float):
-        return repr(v)
-    return str(v)
-
-
 class LSLSink:
     """Pushes samples to Lab Streaming Layer outlets (one per stream).
 
     Two outlets are created lazily as data arrives:
 
-    * ``Mudra-SNC`` (type ``EMG``): 1 channel (experimental sEMG value).
-    * ``Mudra-IMU`` (type ``Motion``): 3 channels (ax, ay, az verified int16
-      accelerometer). Gyroscope is not decoded and is not published over LSL;
-      use CSV ``raw_hex`` if you need the raw gyro bytes.
+    * ``Mudra-SNC`` (type ``EMG``): 6 channels ``snc1, snc2, snc3, rms1, rms2,
+      rms3``. The three sEMG signals plus the per-packet RMS of each channel.
+    * ``Mudra-IMU`` (type ``Motion``): 3 channels ``ax, ay, az`` (accelerometer).
 
-    All channels use the ``float32`` LSL format for a uniform schema. Nominal
-    sampling rate is advertised as irregular because the device streams at its
-    own (variable) native rate; each sample is pushed with the exact wall-clock
-    timestamp captured at BLE arrival, converted to LSL seconds. Channel labels
-    are written to the stream metadata so tools such as MNE-Python and OpenViBE
+    All channels use the ``float32`` LSL format. Nominal sampling rate is
+    advertised as irregular because the device streams at its own (variable)
+    native rate; each sample is pushed with the exact wall-clock timestamp
+    captured at BLE arrival, converted to LSL seconds. Channel labels are
+    written to the stream metadata so tools such as MNE-Python and OpenViBE
     display named channels.
     """
 
@@ -180,9 +190,9 @@ class LSLSink:
         assert pylsl is not None
 
         if stream == "snc":
-            name, stype, labels = "Mudra-SNC", "EMG", list(SNC_LABELS)
+            name, stype, labels = "Mudra-SNC", "EMG", list(SNC_COLUMNS)
         else:
-            name, stype, labels = "Mudra-IMU", "Motion", list(IMU_LABELS)
+            name, stype, labels = "Mudra-IMU", "Motion", list(IMU_COLUMNS)
 
         info = pylsl.StreamInfo(
             name=name,
@@ -203,7 +213,7 @@ class LSLSink:
         return outlet
 
     def write(self, stream: str, ts_ns: int, raw: bytes, channels: list) -> None:
-        n = SNC_DECODED_CHANNELS if stream == "snc" else IMU_DECODED_CHANNELS
+        n = SNC_LSL_CHANNELS if stream == "snc" else IMU_LSL_CHANNELS
         sample = [float(c) for c in channels[:n]]
         sample += [0.0] * (n - len(sample))
         outlet = self._get_outlet(stream, n)
@@ -218,9 +228,15 @@ class LSLSink:
 def decode_samples(stream: str, raw: bytes) -> list[list]:
     """Decode a raw packet into one or more per-sample channel lists.
 
-    * ``snc``: one record per int16 sEMG value found in the packet.
-    * ``imu``: one record per accelerometer sample, each ``[ax, ay, az]``.
+    * ``snc``: one row per interleaved sample, each
+      ``[snc1, snc2, snc3, rms1, rms2, rms3]`` where the RMS triple is the
+      per-packet RMS of each channel (identical on every row of the packet).
+    * ``imu``: one row per accelerometer sample, each ``[ax, ay, az]``.
     """
     if stream == "snc":
-        return [[v] for v in protocol.decode_snc_samples(raw)]
+        rows = protocol.decode_snc_channels(raw)
+        if not rows:
+            return []
+        rms = protocol.snc_packet_rms(raw)
+        return [row + rms for row in rows]
     return [list(row) for row in protocol.decode_imu_packet(raw)]

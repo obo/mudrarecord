@@ -48,18 +48,51 @@ def test_decode_imu_short_packet_is_empty():
     assert protocol.decode_imu_packet(b"\x04\x02\x03") == []
 
 
-def test_decode_snc_samples_uses_markers():
-    # header (2 bytes) then [int16][00 80] records
-    buf = bytearray([0x2E, 0xFF])
-    for v in (471, 1520, -819):
-        buf += struct.pack("<h", v) + protocol.SNC_MARKER
-    out = protocol.decode_snc_samples(bytes(buf))
-    assert out == [471, 1520, -819]
+def _snc_packet(rows):
+    """Build a 112-byte SNC packet from [c1,c2,c3] int rows (padded to 18)."""
+    vals = []
+    for r in rows:
+        vals += list(r)
+    while len(vals) < protocol.SNC_DATA_INT16:
+        vals.append(protocol.SNC_CLIP_MAX)
+    vals += [0, 0]  # footer
+    return struct.pack("<%dh" % len(vals), *vals)
 
 
-def test_decode_snc_samples_empty():
-    assert protocol.decode_snc_samples(b"") == []
-    assert protocol.decode_snc_samples(b"\x2e\xff") == []
+def test_decode_snc_channels_deinterleaves():
+    rows_in = [[10, 20, 30], [11, 21, 31], [12, 22, 32]]
+    pkt = _snc_packet(rows_in)
+    out = protocol.decode_snc_channels(pkt)
+    assert len(out) == 18
+    assert out[0] == [10.0, 20.0, 30.0]
+    assert out[1] == [11.0, 21.0, 31.0]
+    assert out[2] == [12.0, 22.0, 32.0]
+
+
+def test_decode_snc_channels_clip_is_nan():
+    import math
+
+    pkt = _snc_packet([[protocol.SNC_CLIP_MIN, 5, protocol.SNC_CLIP_MAX]])
+    out = protocol.decode_snc_channels(pkt)
+    assert math.isnan(out[0][0])
+    assert out[0][1] == 5.0
+    assert math.isnan(out[0][2])
+
+
+def test_snc_packet_rms():
+    import math
+
+    # ch0 valid values 3 and 0 (rest clipped); rms = sqrt((9+0)/2)
+    pkt = _snc_packet([[3, 100, 0], [0, 100, 0]])
+    rms = protocol.snc_packet_rms(pkt)
+    assert math.isclose(rms[0], math.sqrt((9 + 0) / 2), rel_tol=1e-6)
+    assert rms[1] == 100.0  # only valid ch1 samples are 100, 100
+    assert rms[2] == 0.0
+
+
+def test_decode_snc_channels_short_packet_empty():
+    assert protocol.decode_snc_channels(b"") == []
+    assert protocol.decode_snc_channels(b"\x00" * 10) == []
 
 
 def test_parse_battery_and_charging():

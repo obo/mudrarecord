@@ -77,6 +77,12 @@ def main() -> None:
                 "-o", "--output", default="-",
                 help="Output CSV path, or '-' for stdout (default).",
             )
+            p.add_argument(
+                "--include-raw-bytes",
+                action="store_true",
+                help="Add a raw_hex column with the verbatim BLE packet bytes "
+                "(default: emit only decoded float values).",
+            )
 
     args = parser.parse_args()
     if args.command is None:
@@ -216,7 +222,7 @@ async def _cmd_stream(args, mode: str) -> None:
 
     # Build the sink.
     if mode == "csv":
-        sink = CSVSink(args.output)
+        sink = CSVSink(args.output, include_raw=args.include_raw_bytes)
     else:
         sink = LSLSink(source_id=str(device.serial_number or device.address))
     sink.open()

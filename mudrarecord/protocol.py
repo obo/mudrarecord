@@ -23,13 +23,13 @@ mudrarecord always keeps the verbatim raw bytes alongside the decoded values):
   packet always carries both acc and gyro regardless of which enable commands
   were sent.
 
-* SNC characteristic (``0000fff4``), packet type byte ``0x2e``, ~112 bytes:
-      byte 0..1     : header
-      then repeating: [int16 LE sample][0x00 0x80 marker]
-  The int16 values immediately preceding each ``00 80`` marker form the sEMG
-  waveform. This has been observed to produce a clean oscillating signal, but
-  the channel/scaling semantics are not officially documented; treat as
-  EXPERIMENTAL and rely on the raw hex column for anything authoritative.
+* SNC characteristic (``0000fff4``), 112 bytes = 56 int16 LE:
+      indices 0..53  : 18 samples, 3 channels interleaved (snc1, snc2, snc3)
+      indices 54..55 : 2-value footer (not sensor data)
+  Deinterleaving by ``index % 3`` yields three smooth oscillating sEMG
+  waveforms (the three nerve electrodes). The sentinels -32768 / +32767 mark
+  clipped/invalid samples (railed channel or poor electrode contact). See the
+  SNC section further down for details; RMS is computed per packet/channel.
 """
 from __future__ import annotations
 
@@ -143,27 +143,86 @@ def decode_imu_packet(data: bytes) -> List[tuple[int, int, int]]:
     return [tuple(s) for s in decode_acc_samples(data)]
 
 
-# --- Raw SNC decode --------------------------------------------------------
+# --- SNC (sEMG) decode -----------------------------------------------------
+#
+# Reverse-engineered from a live Mudra Band (firmware 6.0.11.5). The vendor
+# software decodes SNC inside a closed-source native library that has no Linux
+# build, so the layout below was derived by analysing the raw BLE packets.
+#
+# A full SNC notification is 112 bytes = 56 signed 16-bit little-endian values:
+#
+#   * indices 0..53  : 18 samples, 3 channels interleaved column-major, i.e.
+#                      sample_i = (snc1_i, snc2_i, snc3_i). Consecutive
+#                      same-channel values form a smooth oscillating waveform.
+#   * indices 54..55 : a 2-value footer (not sensor data).
+#
+# The extreme int16 values -32768 (0x8000) and +32767 (0x7fff) are clip/invalid
+# sentinels the firmware emits when a channel is railed or has poor electrode
+# contact; they are excluded from RMS and reported as NaN in the float output.
+#
+# The 3 SNC channels correspond to the three nerve electrodes (SNC1/SNC2/SNC3 in
+# the vendor SDK). RMS is not transmitted; the native SDK derives it, so
+# mudrarecord computes a per-packet RMS per channel over that packet's valid
+# (non-sentinel) samples.
 
 SNC_TYPE_TAG = 0x2E
-SNC_MARKER = b"\x00\x80"
+SNC_N_CHANNELS = 3
+SNC_SAMPLES_PER_PACKET = 18       # per channel
+SNC_DATA_INT16 = SNC_N_CHANNELS * SNC_SAMPLES_PER_PACKET  # 54
+SNC_CLIP_MIN = -32768
+SNC_CLIP_MAX = 32767
+
+
+def _snc_valid(v: int) -> bool:
+    return v != SNC_CLIP_MIN and v != SNC_CLIP_MAX
+
+
+def decode_snc_channels(data: bytes) -> List[List[float]]:
+    """Decode an SNC packet into per-sample rows of 3 channel float values.
+
+    Returns a list of ``[snc1, snc2, snc3]`` float rows (one per interleaved
+    sample in the packet). Clipped/invalid sentinel values are returned as
+    ``float('nan')`` so downstream tools can distinguish "no signal" from a real
+    zero reading. Returns [] for packets that are too short.
+    """
+    if len(data) < SNC_DATA_INT16 * 2:
+        return []
+    n_int16 = min(len(data) // 2, SNC_DATA_INT16)
+    values = struct.unpack_from("<%dh" % n_int16, data, 0)
+    rows: list[list[float]] = []
+    for i in range(0, (n_int16 // SNC_N_CHANNELS) * SNC_N_CHANNELS, SNC_N_CHANNELS):
+        row = [
+            float(v) if _snc_valid(v) else float("nan")
+            for v in values[i : i + SNC_N_CHANNELS]
+        ]
+        rows.append(row)
+    return rows
+
+
+def snc_packet_rms(data: bytes) -> List[float]:
+    """Compute per-channel RMS over one SNC packet's valid samples.
+
+    Returns three floats ``[rms1, rms2, rms3]``. A channel with no valid samples
+    in the packet yields ``float('nan')``. This is a per-packet value: the same
+    RMS triple applies to every linearized sample row emitted from the packet.
+    """
+    rows = decode_snc_channels(data)
+    rms: list[float] = []
+    for c in range(SNC_N_CHANNELS):
+        vals = [row[c] for row in rows if row[c] == row[c]]  # drop NaN
+        if vals:
+            rms.append((sum(v * v for v in vals) / len(vals)) ** 0.5)
+        else:
+            rms.append(float("nan"))
+    return rms
 
 
 def decode_snc_samples(data: bytes) -> List[int]:
-    """Decode the SNC (sEMG) packet into a list of int16 samples.
+    """Deprecated flat decode kept for reference (channel 1 only).
 
-    Each sample is the int16 immediately preceding a ``00 80`` marker. Verified
-    to yield a clean oscillating waveform on live hardware, but the channel /
-    scaling semantics are not officially documented (treat as experimental).
+    Prefer :func:`decode_snc_channels`. Returns the first SNC channel as ints.
     """
-    samples: list[int] = []
-    n = len(data)
-    i = 2  # skip 2-byte header
-    while i + 2 <= n:
-        if data[i] == 0x00 and data[i + 1] == 0x80 and i >= 2:
-            samples.append(struct.unpack_from("<h", data, i - 2)[0])
-        i += 1
-    return samples
+    return [int(row[0]) if row[0] == row[0] else 0 for row in decode_snc_channels(data)]
 
 
 # --- Small scalar parsers --------------------------------------------------
