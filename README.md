@@ -8,6 +8,8 @@ over BLE and does one thing well: stream every raw channel out as fast as it
 arrives, for as long as you like (until the disk fills up), while the band is
 prevented from acting as a mouse or keyboard.
 
+Created by Ondřej Bojar and Claude Opus 4.8 based on the [Prodilink](https://github.com/JayTheProdigy16/Prodilink) connection tool.
+
 ## Features
 
 - Single CLI tool with four commands: `scan`, `info`, `stream-csv`, `stream-lsl`.
@@ -26,6 +28,21 @@ prevented from acting as a mouse or keyboard.
 - Per-channel `--skip-*` flags: skipped channels are never enabled on the
   device, so the band spends no bandwidth on them and the remaining channels can
   in principle reach a higher rate.
+- Note that accelerometer data is sometimes not obtained, it's not quite clear why.
+
+## Sample Output
+
+Using the included ``live-viewer/live-viewer``, you can create 
+
+```
+mudrarecord stream-csv \
+| live-viewer/live-viewer --width=5s \
+  --group=snc* --group=rms* --group=a* --shared-range-groups=1,2,3
+```
+
+you can get a live plot like this:
+
+![Screenshot of three plots underneath each other](screenshot-of-sample-output.png)
 
 ## Requirements
 

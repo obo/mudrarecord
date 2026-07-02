@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+"""live-viewer: fast real-time plotting of CSV values arriving on stdin.
+
+Reads a CSV stream on stdin (one record per line). The structure is guessed
+automatically from an optional header row and/or the first data rows:
+
+  * The timestamp column is the first column whose values are non-decreasing
+    and look like Unix timestamps (large integers / floats) or ISO-8601
+    strings.
+  * Columns that carry non-numeric string tokens are treated as "channel"
+    (group-selector) columns.
+  * The remaining columns are numeric data channels (int or float).
+
+Plotting uses pyqtgraph (Qt/X11, no Tk) which is fast enough to keep up with
+data arriving at very high rates. A background thread parses stdin as fast as
+possible and fills ring buffers; the GUI redraws on a fixed timer, fully
+decoupled from the incoming data rate.
+
+Ctrl-C (SIGINT) terminates the viewer. Use --width to keep only a trailing
+time window (e.g. 500ms, 3s, 2m, 1h) and roll out older data. When a channel
+receives no fresh samples inside the window it is held flat at its last known
+value (it does not disappear). Timestamps are shown as YYMMDD-hhmmss.
+
+See --help for options.
+"""
+
+import sys
+import os
+import re
+import signal
+import argparse
+import threading
+import collections
+import math
+import warnings
+
+import numpy as np
+
+# NaN values are used intentionally to create gaps in lines (missing samples
+# and pre-first-sample holds); silence the resulting all-NaN reductions.
+warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+MAX_POINTS = 500_000          # ring buffer capacity per channel (points kept)
+REDRAW_INTERVAL_MS = 33       # ~30 fps GUI redraw, independent of data rate
+X_TICK_MS = 1000              # x-axis ticks every 1000 ms
+
+# Line palette tuned for a white background (dark, saturated, distinguishable).
+PALETTE = [
+    (200,  30,  30),   # red
+    ( 30,  90, 200),   # blue
+    ( 30, 150,  60),   # green
+    (200, 130,   0),   # orange
+    (140,  50, 190),   # purple
+    (  0, 150, 160),   # teal
+    (190,  60, 140),   # magenta/pink
+    (110, 100,  40),   # olive/brown
+    ( 60,  60,  60),   # dark grey
+    ( 30, 170, 200),   # cyan
+    (150,  90,  30),   # brown
+    ( 90, 120,  20),   # dark lime
+]
+
+
+def parse_duration(text):
+    """Parse a duration like '500ms', '3s', '2m', '1h' into milliseconds.
+    A bare number is interpreted as seconds. Returns float ms or None."""
+    if text is None:
+        return None
+    t = text.strip().lower()
+    m = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*(ms|s|m|h)?", t)
+    if not m:
+        raise argparse.ArgumentTypeError("invalid duration: %r" % text)
+    val = float(m.group(1))
+    unit = m.group(2) or "s"
+    factor = {"ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0}[unit]
+    return val * factor
+
+
+# --------------------------------------------------------------------------
+# CSV structure guessing
+# --------------------------------------------------------------------------
+
+def looks_like_number(tok):
+    if tok is None:
+        return False
+    tok = tok.strip()
+    if tok == "":
+        return None  # empty / missing: no information
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def looks_like_iso(tok):
+    if not tok:
+        return False
+    t = tok.strip()
+    # crude: has a 'T' and digits and ':' , or ends with Z
+    return ("T" in t and ":" in t and any(c.isdigit() for c in t)) or t.endswith("Z")
+
+
+def is_header_row(fields):
+    """A row is a header if none of its non-empty fields parse as numbers and
+    it does not look like a timestamp row."""
+    non_empty = [f for f in fields if f.strip() != ""]
+    if not non_empty:
+        return False
+    for f in non_empty:
+        if looks_like_number(f) or looks_like_iso(f):
+            return False
+    return True
+
+
+class Structure:
+    """Holds the guessed layout of the CSV stream."""
+
+    def __init__(self, ncols, header=None):
+        self.ncols = ncols
+        self.header = header                     # list[str] or None
+        self.ts_col = None                       # index of timestamp column
+        self.ts_is_iso = False
+        self.channel_cols = []                   # string/group-selector columns
+        self.numeric_cols = []                   # data channels
+        self.col_kind = ["?"] * ncols            # 'ts','chan','num','?'
+
+    def column_name(self, idx):
+        if self.header and idx < len(self.header) and self.header[idx].strip():
+            return self.header[idx].strip()
+        return "col%d" % (idx + 1)
+
+    def describe(self):
+        lines = ["Guessed CSV structure (%d columns):" % self.ncols]
+        for i in range(self.ncols):
+            lines.append("  [%2d] %-16s %s" %
+                         (i + 1, self.column_name(i), self.col_kind[i]))
+        return "\n".join(lines)
+
+
+def guess_structure(header, sample_rows):
+    """Guess structure from an optional header and a list of sample data rows
+    (each a list of string fields)."""
+    ncols = 0
+    if header:
+        ncols = len(header)
+    for r in sample_rows:
+        ncols = max(ncols, len(r))
+    st = Structure(ncols, header)
+
+    # Per-column analysis over the sample rows.
+    numeric_votes = [0] * ncols
+    string_votes = [0] * ncols
+    iso_votes = [0] * ncols
+    seen = [0] * ncols
+    col_values = [[] for _ in range(ncols)]
+
+    for r in sample_rows:
+        for i in range(ncols):
+            tok = r[i] if i < len(r) else ""
+            v = looks_like_number(tok)
+            if v is None:
+                continue  # empty
+            seen[i] += 1
+            if v:
+                numeric_votes[i] += 1
+                try:
+                    col_values[i].append(float(tok))
+                except ValueError:
+                    pass
+            else:
+                string_votes[i] += 1
+                if looks_like_iso(tok):
+                    iso_votes[i] += 1
+
+    # Find timestamp column: prefer the first column that is (a) numeric &
+    # non-decreasing & large, or (b) ISO strings & non-decreasing.
+    def non_decreasing(vals):
+        return all(vals[k] <= vals[k + 1] for k in range(len(vals) - 1))
+
+    ts_candidate = None
+    for i in range(ncols):
+        if seen[i] == 0:
+            continue
+        # ISO timestamp column
+        if iso_votes[i] > 0 and iso_votes[i] == string_votes[i]:
+            # ISO strings are lexically non-decreasing when chronological
+            vals = [r[i] for r in sample_rows if i < len(r) and r[i].strip()]
+            if len(vals) >= 2 and all(vals[k] <= vals[k + 1]
+                                      for k in range(len(vals) - 1)):
+                ts_candidate = (i, True)
+                break
+        # numeric timestamp: large magnitude & non-decreasing
+        if numeric_votes[i] > 0 and string_votes[i] == 0 and col_values[i]:
+            v = col_values[i]
+            if len(v) >= 2 and non_decreasing(v) and max(abs(x) for x in v) > 1e6:
+                ts_candidate = (i, False)
+                break
+
+    if ts_candidate is not None:
+        st.ts_col, st.ts_is_iso = ts_candidate
+        st.col_kind[st.ts_col] = "ts"
+
+    # Classify remaining columns.
+    for i in range(ncols):
+        if i == st.ts_col:
+            continue
+        if seen[i] == 0:
+            # no data seen; if header exists guess by nothing -> treat numeric
+            st.numeric_cols.append(i)
+            st.col_kind[i] = "num"
+            continue
+        if string_votes[i] > numeric_votes[i]:
+            # A string column. If it is (mostly) ISO timestamps it is an
+            # auxiliary time column, not a channel selector.
+            if iso_votes[i] > 0 and iso_votes[i] >= 0.5 * string_votes[i]:
+                st.col_kind[i] = "iso"     # ignored for plotting/selecting
+            else:
+                st.channel_cols.append(i)
+                st.col_kind[i] = "chan"
+        else:
+            st.numeric_cols.append(i)
+            st.col_kind[i] = "num"
+
+    return st
+
+
+# --------------------------------------------------------------------------
+# Timestamp parsing
+# --------------------------------------------------------------------------
+
+def parse_ts_numeric(tok):
+    """Return time in milliseconds (float). Auto-detects ns/us/ms/s scale."""
+    try:
+        v = float(tok)
+    except (ValueError, TypeError):
+        return None
+    a = abs(v)
+    if a > 1e17:      # nanoseconds
+        return v / 1e6
+    if a > 1e14:      # microseconds
+        return v / 1e3
+    if a > 1e11:      # milliseconds
+        return v
+    return v * 1000.0  # seconds
+
+
+def parse_ts_iso(tok):
+    """Parse ISO-8601 to milliseconds. Best effort without pulling in heavy
+    deps; nanosecond fractions are supported."""
+    try:
+        import datetime
+        t = tok.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        # datetime.fromisoformat handles up to microseconds; trim extra digits.
+        if "." in t:
+            head, frac = t.split(".", 1)
+            # frac may include timezone
+            tz = ""
+            for sep in ("+", "-"):
+                idx = frac.find(sep)
+                if idx > 0:
+                    tz = frac[idx:]
+                    frac = frac[:idx]
+                    break
+            frac6 = (frac + "000000")[:6]
+            t = head + "." + frac6 + tz
+        dt = datetime.datetime.fromisoformat(t)
+        return dt.timestamp() * 1000.0
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Group specification parsing
+# --------------------------------------------------------------------------
+
+class GroupSpec:
+    """A --group specification. In priority order it is interpreted as:
+
+      * a set of 1-based column numbers / ranges  (e.g. '4-9', '1,3,5')
+      * a wildcard pattern matching header column names (e.g. 'snc*', 'a*')
+      * a plain channel token selecting rows by a channel column's value
+        (e.g. 'imu', 'snc')
+    """
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.columns = None    # explicit 0-based column indices, or None
+        self.pattern = None    # header-name wildcard pattern, or None
+        self.channel = None    # channel token string, or None
+
+        cols = self._try_parse_columns(raw)
+        if cols is not None:
+            self.columns = cols
+        elif any(ch in raw for ch in "*?[") :
+            self.pattern = raw
+        else:
+            self.channel = raw
+
+    @staticmethod
+    def _try_parse_columns(raw):
+        """Parse '4-9', '1,3,5', '4-9,11' -> list of 0-based indices, else None."""
+        cols = []
+        parts = raw.split(",")
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if "-" in p:
+                a, _, b = p.partition("-")
+                if not (a.strip().isdigit() and b.strip().isdigit()):
+                    return None
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                cols.extend(range(lo - 1, hi))  # 1-based inclusive -> 0-based
+            else:
+                if not p.isdigit():
+                    return None
+                cols.append(int(p) - 1)
+        return cols if cols else None
+
+
+# --------------------------------------------------------------------------
+# Channel: a single plotted line with its own ring buffer & autoscale
+# --------------------------------------------------------------------------
+
+class Channel:
+    __slots__ = ("name", "col", "xs", "ys", "present", "count",
+                 "vmin", "vmax", "last_val", "curve", "scatter",
+                 "dirty", "scatter_count")
+
+    def __init__(self, name, col):
+        self.name = name
+        self.col = col                       # source column index
+        self.xs = np.empty(MAX_POINTS, dtype=np.float64)
+        self.ys = np.empty(MAX_POINTS, dtype=np.float64)
+        self.present = np.empty(MAX_POINTS, dtype=bool)  # True if real point
+        self.count = 0
+        self.vmin = math.inf
+        self.vmax = -math.inf
+        self.last_val = math.nan
+        self.curve = None
+        self.scatter = None
+        self.dirty = False
+        self.scatter_count = -1   # count at last scatter setData
+
+    def append(self, x, val_or_none):
+        i = self.count
+        if i >= MAX_POINTS:
+            # shift out oldest half (rare with big buffer); keep it simple.
+            keep = MAX_POINTS // 2
+            self.xs[:keep] = self.xs[MAX_POINTS - keep:]
+            self.ys[:keep] = self.ys[MAX_POINTS - keep:]
+            self.present[:keep] = self.present[MAX_POINTS - keep:]
+            self.count = keep
+            i = keep
+        self.xs[i] = x
+        if val_or_none is None:
+            # missing: hold last known value, but not a real point
+            self.ys[i] = self.last_val
+            self.present[i] = False
+        else:
+            self.ys[i] = val_or_none
+            self.present[i] = True
+            self.last_val = val_or_none
+            if val_or_none < self.vmin:
+                self.vmin = val_or_none
+            if val_or_none > self.vmax:
+                self.vmax = val_or_none
+        self.count += 1
+        self.dirty = True
+
+    def prune(self, x_lo):
+        """Drop samples older than x_lo so the buffer does not grow without
+        bound. One sample strictly before x_lo is kept so the line/scale still
+        knows the value 'in effect' at the left edge. The array shift is
+        amortized: it only runs once the dead prefix is sizeable. Returns True
+        if anything was dropped."""
+        n = self.count
+        if n == 0:
+            return False
+        # index of first sample inside the window
+        i0 = int(np.searchsorted(self.xs[:n], x_lo, side="left"))
+        drop = i0 - 1          # keep one sample to the left of the window
+        # Only compact when the dead prefix is worth the O(n) shift.
+        if drop < 512 and drop < (n >> 2):
+            return False
+        keep = n - drop
+        self.xs[:keep] = self.xs[drop:n]
+        self.ys[:keep] = self.ys[drop:n]
+        self.present[:keep] = self.present[drop:n]
+        self.count = keep
+        # scatter_count tracks absolute appends; force a scatter refresh.
+        self.scatter_count = -1
+        # Recompute vmin/vmax from the retained real samples.
+        pres = self.present[:keep]
+        if pres.any():
+            seg = self.ys[:keep][pres]
+            self.vmin = float(seg.min())
+            self.vmax = float(seg.max())
+        else:
+            self.vmin = math.inf
+            self.vmax = -math.inf
+        return True
+
+
+# --------------------------------------------------------------------------
+# Fast stdin reader thread
+# --------------------------------------------------------------------------
+
+class Reader(threading.Thread):
+    def __init__(self, structure, plan, line_source):
+        super().__init__(daemon=True)
+        self.st = structure
+        self.plan = plan            # list of (channels, match_col, match_val)
+        self.line_source = line_source   # iterable of raw lines (str)
+        self.lock = threading.Lock()
+        self.stop_flag = False
+        self.eof = False
+        self._synth = 0
+
+    def run(self):
+        st = self.st
+        ts_col = st.ts_col
+        ts_iso = st.ts_is_iso
+        for line in self.line_source:
+            if self.stop_flag:
+                break
+            line = line.rstrip("\n").rstrip("\r")
+            if not line:
+                continue
+            fields = line.split(",")
+            if ts_col is not None and ts_col < len(fields):
+                x = parse_ts_iso(fields[ts_col]) if ts_iso \
+                    else parse_ts_numeric(fields[ts_col])
+            else:
+                x = None
+            if x is None:
+                self._synth += 1
+                x = float(self._synth)
+            self._dispatch(fields, x)
+        self.eof = True
+
+    def _dispatch(self, fields, x):
+        plan = self.plan
+        with self.lock:
+            for (channels, match_col, match_val) in plan:
+                if match_col is not None:
+                    # channel-token group: only rows whose channel column matches
+                    v = fields[match_col].strip() if match_col < len(fields) else ""
+                    if v != match_val:
+                        continue
+                for ch in channels:
+                    c = ch.col
+                    tok = fields[c].strip() if c < len(fields) else ""
+                    if tok == "":
+                        ch.append(x, None)
+                    else:
+                        try:
+                            val = float(tok)
+                        except ValueError:
+                            ch.append(x, None)
+                            continue
+                        # Treat NaN/inf (incl. literal "nan") as missing: hold
+                        # the last value and draw no point.
+                        if val != val or val in (float("inf"), float("-inf")):
+                            ch.append(x, None)
+                        else:
+                            ch.append(x, val)
+
+
+# --------------------------------------------------------------------------
+# Building plot groups from specs & structure
+# --------------------------------------------------------------------------
+
+def build_groups(st, specs, sample_rows):
+    """Return (groups, group_titles, plan).
+
+    groups: list of list[Channel]
+    group_titles: list[str]
+    plan: list of (channels, match_col, match_val) for the reader
+    sample_rows is used to prune all-empty numeric columns from channel-token
+    groups (e.g. the 'imu' group should not list the always-empty snc columns).
+    """
+    numeric_set = set(st.numeric_cols)
+    groups = []
+    titles = []
+    plan = []
+
+    if not specs:
+        specs = [None]  # single default group: all numeric columns
+
+    # For disambiguating duplicate line names across the whole viewer we
+    # dedupe within each group.
+    for gi, spec in enumerate(specs):
+        channels = []
+        match_col = None
+        match_val = None
+        title = None
+
+        if spec is None:
+            cols = list(st.numeric_cols)
+            title = "all"
+        elif spec.columns is not None:
+            cols = [c for c in spec.columns if 0 <= c < st.ncols]
+            title = spec.raw
+        elif spec.pattern is not None:
+            # wildcard on header column names (numeric columns only)
+            import fnmatch
+            title = spec.raw
+            cols = []
+            for c in st.numeric_cols:
+                name = st.header[c].strip() if (st.header and c < len(st.header)) else ""
+                if name and fnmatch.fnmatch(name, spec.pattern):
+                    cols.append(c)
+        else:
+            # channel token: match rows where a channel column == token,
+            # plot all numeric columns that actually carry data for that token.
+            match_val = spec.channel
+            title = spec.channel
+            if st.channel_cols:
+                match_col = st.channel_cols[0]
+            cols = list(st.numeric_cols)
+            # Prune numeric columns that are always empty for matching rows.
+            if match_col is not None:
+                nonempty = set()
+                for r in sample_rows:
+                    if match_col < len(r) and r[match_col].strip() == match_val:
+                        for c in cols:
+                            if c < len(r) and r[c].strip() != "":
+                                nonempty.add(c)
+                if nonempty:
+                    cols = [c for c in cols if c in nonempty]
+
+        # Build channel objects with names.
+        have_header = bool(st.header)
+        # Determine raw names from the header if present.
+        raw_names = []
+        for c in cols:
+            if have_header and c < len(st.header) and st.header[c].strip():
+                raw_names.append(st.header[c].strip())
+            else:
+                raw_names.append(None)   # no usable header name
+
+        if all(n is not None for n in raw_names) and raw_names:
+            # Use header names, disambiguating duplicates with an index.
+            counts = collections.Counter(raw_names)
+            seen = collections.Counter()
+            for c, rn in zip(cols, raw_names):
+                if counts[rn] > 1:
+                    seen[rn] += 1
+                    name = "%s-%d" % (rn, seen[rn])
+                else:
+                    name = rn
+                channels.append(Channel(name, c))
+        else:
+            # No usable header: name channels <base>-<n>.
+            base = title if (title and title != "all") else "G"
+            for idx, c in enumerate(cols, 1):
+                channels.append(Channel("%s-%d" % (base, idx), c))
+
+        groups.append(channels)
+        titles.append(title or ("G%d" % (gi + 1)))
+        plan.append((channels, match_col, match_val))
+
+    return groups, titles, plan
+
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+
+def _visible_range(ch, x_lo):
+    """Min/max of the values *in effect* for a channel from x_lo onward.
+
+    Includes the real samples at/after x_lo, plus the value held-forward from
+    just before x_lo (so a channel that is flat across the whole window still
+    reports a valid range). Returns (lo, hi) or (None, None) if the channel has
+    never had a real value.
+    """
+    n = ch.count
+    if n == 0 or not math.isfinite(ch.vmin):
+        return (None, None)
+    xs = ch.xs[:n]
+    i0 = int(np.searchsorted(xs, x_lo, side="left"))
+    pres = ch.present[i0:n]
+    lo = math.inf
+    hi = -math.inf
+    if pres.any():
+        seg = ch.ys[i0:n][pres]
+        lo = float(seg.min())
+        hi = float(seg.max())
+    # include the held value in effect at the left edge
+    if i0 > 0:
+        held = ch.ys[i0 - 1]
+        if math.isfinite(held):
+            lo = min(lo, held)
+            hi = max(hi, held)
+    if not math.isfinite(lo):
+        return (None, None)
+    return (lo, hi)
+
+
+def run_gui(structure, groups, titles, reader, shared_groups, style, width_ms):
+    import pyqtgraph as pg
+    from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+    # Keep rendering cheap: no antialiasing (huge cost with many line
+    # segments) and clip to the viewport. No point subsampling: every point
+    # in the window is drawn. Scatter symbols are the expensive part, so their
+    # data is set only when new samples arrive; per-channel scaling and window
+    # scrolling are done via a cheap Y transform + X range change each frame.
+    pg.setConfigOptions(antialias=False, useOpenGL=False,
+                        background="w", foreground="k")
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    # Make Ctrl-C (SIGINT) terminate the application. Python signal handlers
+    # only run between bytecode ops, so we also nudge the Qt event loop with a
+    # periodic no-op timer to give the interpreter a chance to react.
+    def _sigint(_sig, _frm):
+        reader.stop_flag = True
+        app.quit()
+    signal.signal(signal.SIGINT, _sigint)
+    try:
+        signal.signal(signal.SIGTERM, _sigint)
+    except Exception:
+        pass
+
+    win = pg.GraphicsLayoutWidget(show=True, title="live-viewer")
+    win.resize(1200, 200 + 260 * len(groups))
+
+    palette = PALETTE
+
+    style = style.lower()
+    draw_line = style in ("lines", "linespoints")
+    draw_points = style in ("points", "linespoints")
+
+    class MsAxis(pg.AxisItem):
+        """X axis showing timestamps as YYMMDD-hhmmss, with a tick roughly
+        every X_TICK_MS ms (subject to available space)."""
+        def tickValues(self, minVal, maxVal, size):
+            if not math.isfinite(minVal) or not math.isfinite(maxVal) \
+                    or maxVal <= minVal:
+                return []
+            # Choose a tick spacing that is a multiple of X_TICK_MS but keeps
+            # the number of labels reasonable for the current width.
+            span = maxVal - minVal
+            spacing = X_TICK_MS
+            max_ticks = max(2, int((size or 600) / 90))  # ~90 px per label
+            while span / spacing > max_ticks:
+                spacing *= 2
+            start = math.ceil(minVal / spacing) * spacing
+            majors = []
+            v = start
+            while v <= maxVal and len(majors) < 2000:
+                majors.append(v)
+                v += spacing
+            return [(spacing, majors)]
+
+        def tickStrings(self, values, scale, spacing):
+            import datetime
+            out = []
+            for v in values:
+                try:
+                    dt = datetime.datetime.fromtimestamp(v / 1000.0)
+                    out.append(dt.strftime("%y%m%d-%H%M%S"))
+                except (ValueError, OSError, OverflowError):
+                    out.append("%.0f" % v)
+            return out
+
+    shared = set(shared_groups)
+
+    plots = []
+    for gi, (channels, title) in enumerate(zip(groups, titles)):
+        p = win.addPlot(row=gi, col=0, title=title,
+                        axisItems={"bottom": MsAxis(orientation="bottom")})
+        p.showGrid(x=True, y=True, alpha=0.3)
+        p.setMouseEnabled(x=False, y=False)   # auto-follow the rolling window
+        # Y-axis values are only meaningful for shared-range groups. Non-shared
+        # groups normalise each channel independently to [0,1], so their y-axis
+        # numbers are meaningless -> hide the tick labels there.
+        if gi not in shared:
+            p.getAxis("left").setStyle(showValues=False)
+            p.getAxis("left").setWidth(20)
+        # Clip drawing to the viewport so off-screen points cost nothing, but
+        # do NOT downsample: every point inside the window must be drawn.
+        p.setClipToView(True)
+        p.addLegend(offset=(-10, 10))         # legend on the right side
+        legend = p.legend
+        try:
+            legend.anchor(itemPos=(1, 0), parentPos=(1, 0), offset=(-10, 10))
+        except Exception:
+            pass
+        for ci, ch in enumerate(channels):
+            color = palette[ci % len(palette)]
+            if draw_line:
+                ch.curve = p.plot([], [], pen=pg.mkPen(color=color, width=1),
+                                  name=ch.name, connect="finite")
+                ch.curve.setClipToView(True)
+            if draw_points:
+                ch.scatter = pg.ScatterPlotItem(
+                    size=5, brush=pg.mkBrush(color), pen=None)
+                p.addItem(ch.scatter)
+                if not draw_line:
+                    p.legend.addItem(ch.scatter, ch.name)
+        plots.append(p)
+
+    def window_bounds():
+        """Return (x_lo, x_hi) of the rolling window, or None if no data."""
+        xmax = -math.inf
+        for channels in groups:
+            for ch in channels:
+                if ch.count:
+                    v = ch.xs[ch.count - 1]
+                    if v > xmax:
+                        xmax = v
+        if not math.isfinite(xmax):
+            return None
+        if width_ms is not None:
+            return (xmax - width_ms, xmax)
+        # no --width: show everything from the earliest sample
+        xmin = math.inf
+        for channels in groups:
+            for ch in channels:
+                if ch.count and ch.xs[0] < xmin:
+                    xmin = ch.xs[0]
+        if not math.isfinite(xmin):
+            xmin = xmax
+        return (xmin, xmax)
+
+    def _set_y_transform(item, lo, hi):
+        """Map real y-values [lo,hi] onto the subplot's [0,1] band via a cheap
+        item transform (no data rebuild): y' = (y - lo) / (hi - lo).
+        A flat channel (hi == lo) is drawn centred at y' = 0.5."""
+        tr = QtGui.QTransform()
+        if hi <= lo:
+            # constant value -> draw centred: y' = 0.5 (use span 1 around value)
+            tr.scale(1.0, 1.0)
+            tr.translate(0.0, 0.5 - lo)
+        else:
+            inv = 1.0 / (hi - lo)
+            tr.scale(1.0, inv)
+            tr.translate(0.0, -lo)
+        item.setTransform(tr)
+
+    _identity = QtGui.QTransform()
+
+    def redraw():
+        wb = window_bounds()
+        if wb is None:
+            return
+        x_lo, x_hi = wb
+        if x_hi <= x_lo:
+            x_hi = x_lo + 1.0
+
+        for gi, (channels, p) in enumerate(zip(groups, plots)):
+            use_shared = gi in shared
+            group_min = math.inf
+            group_max = -math.inf
+
+            with reader.lock:
+                # Forget samples that have scrolled out of the --width window so
+                # the buffers (and per-frame work) do not grow over time.
+                if width_ms is not None:
+                    for ch in channels:
+                        ch.prune(x_lo)
+
+                if use_shared:
+                    for ch in channels:
+                        lo, hi = _visible_range(ch, x_lo)
+                        if lo is not None:
+                            group_min = min(group_min, lo)
+                            group_max = max(group_max, hi)
+
+                for ch in channels:
+                    n = ch.count
+                    if n == 0:
+                        continue
+                    xs = ch.xs[:n]
+
+                    # Index of the first sample inside the window.
+                    i0 = int(np.searchsorted(xs, x_lo, side="left"))
+                    xw = xs[i0:n]
+                    yw = ch.ys[i0:n]
+
+                    has_left = i0 > 0 and math.isfinite(ch.ys[i0 - 1])
+                    left_hold = ch.ys[i0 - 1] if has_left else math.nan
+
+                    if xw.size == 0 and not has_left:
+                        if draw_line:
+                            ch.curve.setData([], [])
+                        if draw_points and ch.scatter_count != 0:
+                            ch.scatter.clear()
+                            ch.scatter_count = 0
+                        ch.dirty = False
+                        continue
+
+                    # --- LINE: rebuilt every frame (cheap) with real y-values,
+                    # padded so it spans the window edges (hold-flat behavior).
+                    if draw_line:
+                        need_left = has_left and (xw.size == 0 or xw[0] > x_lo)
+                        last_x = xw[-1] if xw.size else x_lo
+                        last_y = yw[-1] if xw.size else left_hold
+                        need_right = math.isfinite(last_y) and last_x < x_hi
+                        if not need_left and not need_right:
+                            xf, yf = xw, yw
+                        else:
+                            px, py = [], []
+                            if need_left:
+                                px.append(np.array((x_lo,)))
+                                py.append(np.array((left_hold,)))
+                            if xw.size:
+                                px.append(xw)
+                                py.append(yw)
+                            if need_right:
+                                px.append(np.array((x_hi,)))
+                                py.append(np.array((last_y,)))
+                            xf = np.concatenate(px)
+                            yf = np.concatenate(py)
+                        ch.curve.setData(xf, yf)
+
+                    # --- SCATTER: real points only, set ONCE per new data (not
+                    # every frame). Scrolling/scaling is handled by the X range
+                    # and the per-channel Y transform below.
+                    if draw_points and ch.count != ch.scatter_count:
+                        pres = ch.present[:n]
+                        if pres.any():
+                            ch.scatter.setData(xs[pres], ch.ys[:n][pres])
+                        else:
+                            ch.scatter.clear()
+                        ch.scatter_count = ch.count
+
+                    # --- per-channel Y scaling via transform (no data rebuild).
+                    if not use_shared:
+                        lo, hi = _visible_range(ch, x_lo)
+                        if lo is None:
+                            if math.isfinite(ch.vmin):
+                                lo, hi = ch.vmin, ch.vmax
+                            else:
+                                continue
+                        if draw_line:
+                            _set_y_transform(ch.curve, lo, hi)
+                        if draw_points:
+                            _set_y_transform(ch.scatter, lo, hi)
+
+                    ch.dirty = False
+
+            # Y range.
+            if use_shared:
+                if math.isfinite(group_min) and math.isfinite(group_max):
+                    lo, hi = group_min, group_max
+                    if hi <= lo:
+                        hi = lo + 1.0
+                    pad = (hi - lo) * 0.05
+                    p.setYRange(lo - pad, hi + pad, padding=0)
+            else:
+                p.setYRange(0.0, 1.0, padding=0.02)
+
+            p.setXRange(x_lo, x_hi, padding=0)
+
+    win.show()
+
+    timer = QtCore.QTimer()
+    timer.timeout.connect(redraw)
+    timer.start(REDRAW_INTERVAL_MS)
+
+    # Keep the interpreter responsive to SIGINT while inside the Qt loop.
+    sig_timer = QtCore.QTimer()
+    sig_timer.timeout.connect(lambda: None)
+    sig_timer.start(100)
+
+    app.exec_()
+    reader.stop_flag = True
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        description="Fast live viewer for CSV values arriving on stdin.")
+    ap.add_argument("--style", choices=["lines", "points", "linespoints"],
+                    default="linespoints",
+                    help="how to draw each channel (default: linespoints)")
+    ap.add_argument("--group", action="append", default=[],
+                    help="define a plot group; may be given multiple times. "
+                         "A group is either a set of 1-based column "
+                         "numbers/ranges (e.g. '4-9' or '1,3,5'), a wildcard "
+                         "matching header column names (e.g. 'snc*', 'a*'), or "
+                         "a channel token (e.g. 'imu') selecting rows by their "
+                         "channel column.")
+    ap.add_argument("--shared-range-groups", default="",
+                    help="comma-separated 1-based indices of groups (top to "
+                         "bottom) that should share a common min/max across all "
+                         "their channels, e.g. '1,3,4'.")
+    ap.add_argument("--width", type=parse_duration, default=None,
+                    help="width of the rolling time window to display; older "
+                         "data is rolled out. Accepts e.g. 500ms, 3s, 2m, 1h. "
+                         "If given multiple times only the last is used. "
+                         "Without it, the full history is shown.")
+    return ap.parse_args(argv)
+
+
+def read_sample(nrows=400):
+    """Read the header (if any) plus some sample rows for structure guessing,
+    without losing them from the stream."""
+    lines = []
+    for _ in range(nrows):
+        line = sys.stdin.readline()
+        if not line:
+            break
+        lines.append(line.rstrip("\n").rstrip("\r"))
+    return lines
+
+
+class PrereadStdin:
+    """Iterable yielding pre-read sample lines first, then the live stream."""
+    def __init__(self, buffered_lines, real):
+        self._buf = buffered_lines
+        self._real = real
+
+    def __iter__(self):
+        for l in self._buf:
+            yield l
+        for l in self._real:
+            yield l
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+
+    sample_lines = read_sample()
+    if not sample_lines:
+        sys.stderr.write("live-viewer: no input on stdin\n")
+        return 1
+
+    split_rows = [l.split(",") for l in sample_lines]
+
+    header = None
+    data_lines = sample_lines
+    data_rows = split_rows
+    if is_header_row(split_rows[0]):
+        header = [h.strip() for h in split_rows[0]]
+        data_rows = split_rows[1:]
+        data_lines = sample_lines[1:]
+
+    st = guess_structure(header, data_rows)
+    sys.stderr.write(st.describe() + "\n")
+    if st.ts_col is not None:
+        sys.stderr.write("Timestamp column: %d (%s)\n" %
+                         (st.ts_col + 1, "ISO" if st.ts_is_iso else "numeric"))
+    sys.stderr.flush()
+
+    specs = [GroupSpec(g) for g in args.group]
+    groups, titles, plan = build_groups(st, specs, data_rows)
+
+    shared = []
+    if args.shared_range_groups.strip():
+        for tok in args.shared_range_groups.split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                shared.append(int(tok) - 1)  # 1-based -> 0-based
+
+    # Reader replays the buffered DATA lines first, then the live stdin.
+    line_source = PrereadStdin(list(data_lines), sys.stdin)
+    reader = Reader(st, plan, line_source)
+    reader.start()
+
+    run_gui(st, groups, titles, reader, shared, args.style, args.width)
+    reader.stop_flag = True
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
