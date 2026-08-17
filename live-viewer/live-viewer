@@ -21,6 +21,11 @@ time window (e.g. 500ms, 3s, 2m, 1h) and roll out older data. When a channel
 receives no fresh samples inside the window it is held flat at its last known
 value (it does not disappear). Timestamps are shown as YYMMDD-hhmmss.
 
+Use --realtime-replay to pace a recorded CSV file fed on stdin according to
+its own timestamp column: the first timestamp is anchored to "now" and
+subsequent lines are held back so they are dispatched at the same pace they
+were originally recorded, simulating a live feed.
+
 See --help for options.
 """
 
@@ -32,6 +37,7 @@ import argparse
 import threading
 import collections
 import math
+import time
 import warnings
 
 import numpy as np
@@ -418,7 +424,7 @@ class Channel:
 # --------------------------------------------------------------------------
 
 class Reader(threading.Thread):
-    def __init__(self, structure, plan, line_source):
+    def __init__(self, structure, plan, line_source, realtime_replay=False):
         super().__init__(daemon=True)
         self.st = structure
         self.plan = plan            # list of (channels, match_col, match_val)
@@ -427,6 +433,9 @@ class Reader(threading.Thread):
         self.stop_flag = False
         self.eof = False
         self._synth = 0
+        self.realtime_replay = realtime_replay
+        self._replay_first_x = None    # timestamp (ms) of the first real sample
+        self._replay_start_wall = None  # time.monotonic() at that first sample
 
     def run(self):
         st = self.st
@@ -447,8 +456,27 @@ class Reader(threading.Thread):
             if x is None:
                 self._synth += 1
                 x = float(self._synth)
+            elif self.realtime_replay:
+                self._pace(x)
             self._dispatch(fields, x)
         self.eof = True
+
+    def _pace(self, x_ms):
+        """Block until wall-clock time has advanced by as much as x_ms has
+        advanced since the first timestamped sample (which is anchored to
+        'now')."""
+        now = time.monotonic()
+        if self._replay_first_x is None:
+            self._replay_first_x = x_ms
+            self._replay_start_wall = now
+            return
+        target_wall = self._replay_start_wall + (x_ms - self._replay_first_x) / 1000.0
+        while not self.stop_flag:
+            now = time.monotonic()
+            delay = target_wall - now
+            if delay <= 0:
+                break
+            time.sleep(min(delay, 0.2))
 
     def _dispatch(self, fields, x):
         plan = self.plan
@@ -909,6 +937,14 @@ def parse_args(argv):
                          "data is rolled out. Accepts e.g. 500ms, 3s, 2m, 1h. "
                          "If given multiple times only the last is used. "
                          "Without it, the full history is shown.")
+    ap.add_argument("--realtime-replay", action="store_true",
+                    help="pace stdin according to its own timestamp column "
+                         "instead of consuming it as fast as possible: the "
+                         "first timestamp seen is anchored to the current "
+                         "wall-clock time, and later lines are held back so "
+                         "they are dispatched only once that much real time "
+                         "has elapsed. Useful for replaying a recorded CSV "
+                         "as if it were arriving live.")
     return ap.parse_args(argv)
 
 
@@ -974,7 +1010,7 @@ def main():
 
     # Reader replays the buffered DATA lines first, then the live stdin.
     line_source = PrereadStdin(list(data_lines), sys.stdin)
-    reader = Reader(st, plan, line_source)
+    reader = Reader(st, plan, line_source, realtime_replay=args.realtime_replay)
     reader.start()
 
     run_gui(st, groups, titles, reader, shared, args.style, args.width)
