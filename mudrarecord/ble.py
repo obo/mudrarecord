@@ -81,6 +81,11 @@ class BleConnection:
                 continue
             name = props.get("Name", "")
             if name and DEVICE_NAME_FILTER in name.lower():
+                logger.debug(
+                    "bonded/known in BlueZ: %s %s Paired=%s Connected=%s RSSI=%s",
+                    name, props.get("Address"), props.get("Paired"),
+                    props.get("Connected"), props.get("RSSI"),
+                )
                 devices.append(
                     BLEDevice(
                         address=props.get("Address", ""),
@@ -114,16 +119,26 @@ class BleConnection:
         """Return Mudra devices: bonded first, then a fresh scan."""
         bonded = await BleConnection._find_bonded()
         if bonded:
+            # Known devices are returned even if not currently in range.
+            logger.debug("using %d device(s) known to BlueZ, no scan", len(bonded))
             return bonded
-        return await BleConnection._scan(timeout)
+        logger.debug("no Mudra known to BlueZ; scanning for %gs", timeout)
+        found = await BleConnection._scan(timeout)
+        for d in found:
+            logger.debug("scan found: %s %s", d.name, d.address)
+        return found
 
     # --- Connection ---
 
     async def connect(self, device: BLEDevice) -> None:
         _ensure_dbus()
         self._device = device
-        logger.info("Connecting to %s (%s)", device.name, device.address)
         target = device if device.details else device.address
+        logger.debug(
+            "connecting to %s (%s) via %s",
+            device.name, device.address,
+            "BlueZ object" if device.details else "address lookup",
+        )
         self._client = BleakClient(
             target, disconnected_callback=self._handle_disconnect
         )
@@ -137,6 +152,11 @@ class BleConnection:
                 f"Make sure the band is powered on and in range. For bonded "
                 f"devices try: bluetoothctl connect {device.address}"
             ) from e
+        logger.debug("connected; MTU=%s", self._client.mtu_size)
+        for service in self._client.services:
+            logger.debug("service %s", service.uuid)
+            for char in service.characteristics:
+                logger.debug("  char %s [%s]", char.uuid, ",".join(char.properties))
 
         if self.post_connect_delay > 0:
             await asyncio.sleep(self.post_connect_delay)
@@ -176,6 +196,7 @@ class BleConnection:
             await self._client.start_notify(
                 char_uuid, cb, bluez={"use_start_notify": True}
             )
+        logger.debug("subscribed to notifications on %s", char_uuid)
         self._subscribed.add(char_uuid)
 
     async def stop_notify(self, char_uuid: str) -> None:

@@ -112,6 +112,15 @@ class MudraBand:
         await self._read_device_info()
         await self.refresh_status()
         await asyncio.sleep(0.3)
+        s = self.status
+        if s.general is None or s.airmouse is None:
+            logger.debug("no status reply yet: the COMMAND notify channel may not work")
+        logger.debug(
+            "status: snc=%s acc=%s gyro=%s band_mode=%s hand=%s "
+            "gesture->hid=%s nav->hid=%s",
+            s.is_snc_enabled, s.is_acc_enabled, s.is_gyro_enabled, s.band_mode,
+            s.hand, s.is_gesture_to_hid_enabled, s.is_nav_to_hid_enabled,
+        )
 
     async def disconnect(self) -> None:
         await self._conn.disconnect()
@@ -137,6 +146,11 @@ class MudraBand:
             except Exception as e:
                 logger.debug("Failed to read serial %s: %s", side, e)
         self.serial_number = serial
+        logger.debug(
+            "device info: firmware=%r serial=%s battery=%s%% charging=%s",
+            self.firmware_version, self.serial_number, self.battery_level,
+            self.is_charging,
+        )
 
     # --- Status ---
 
@@ -208,9 +222,11 @@ class MudraBand:
     # --- Internal ---
 
     async def _write(self, data: bytes) -> None:
+        logger.debug("-> command %s", data.hex(" "))
         await self._conn.write(Characteristic.COMMAND, data)
 
     def _handle_command(self, _uuid: str, _ts_ns: int, data: bytearray) -> None:
+        logger.debug("<- command notify %s", bytes(data).hex(" "))
         if data and data[0] in (0x01, 0x02):
             self.status.update(bytes(data))
 

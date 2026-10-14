@@ -268,12 +268,13 @@ Prints the name and BLE address of every Mudra Band found.
 ### `info` — print device and channel state
 
 ```
-python3 -m mudrarecord info [--address ADDRESS]
+python3 -m mudrarecord info [--address ADDRESS] [-d]
 ```
 
 | Option              | Meaning                                                                                       |
 |---------------------|-----------------------------------------------------------------------------------------------|
 | `--address ADDRESS` | Connect to the band with this BLE address. Without it, the first band discovered is used.     |
+| `-d, --debug`       | Log every connection step to stderr (see the stream commands below).                          |
 
 Connects and prints name, address, firmware version, serial number, battery,
 charging state, hand, band mode and which channels / HID routes are enabled.
@@ -281,13 +282,13 @@ charging state, hand, band mode and which channels / HID routes are enabled.
 ### `stream-csv` and `stream-lsl` — record
 
 ```
-python3 -m mudrarecord stream-csv [--address ADDRESS] [--rate RATE]
+python3 -m mudrarecord stream-csv [--address ADDRESS] [-d] [--rate RATE]
                                   [--sample-type {16bit,24bit}]
                                   [--skip-snc] [--skip-acc] [--skip-gyro]
                                   [--restore-hid]
                                   [-o OUTPUT] [--include-raw-bytes]
 
-python3 -m mudrarecord stream-lsl [--address ADDRESS] [--rate RATE]
+python3 -m mudrarecord stream-lsl [--address ADDRESS] [-d] [--rate RATE]
                                   [--sample-type {16bit,24bit}]
                                   [--skip-snc] [--skip-acc] [--skip-gyro]
                                   [--restore-hid]
@@ -298,6 +299,7 @@ Options of both stream commands:
 | Option                        | Meaning                                                                                                   |
 |-------------------------------|-----------------------------------------------------------------------------------------------------------|
 | `--address ADDRESS`           | Connect to the band with this BLE address. Without it, the first band discovered is used.                 |
+| `-d, --debug`                 | Log every step to stderr: discovery, connection, GATT services, commands sent, status replies, the first packet of each stream, and packets/s per stream every second. `-dd` also enables bleak's own BlueZ/D-Bus log. |
 | `--rate RATE`                 | `max` (default) emits every sample; an integer `N` keeps 1 of every `N` samples (host-side decimation).   |
 | `--sample-type {16bit,24bit}` | Set the device's ADC sample type. Default: leave the device setting unchanged.                            |
 | `--skip-snc`                  | Do not enable or record the SNC (sEMG) stream.                                                            |
@@ -316,12 +318,25 @@ Accelerometer and gyroscope are delivered together in a single IMU packet, so
 the IMU stream is only disabled — freeing BLE bandwidth for the remaining
 channels — when **both** `--skip-acc` and `--skip-gyro` are given.
 
-On startup both stream commands print to stderr the band they connected to and
+On startup both stream commands print to stderr the band they connect to and
 its firmware version, e.g.
 
 ```
+Connecting to Mudra Band 43-5381 (F5:FC:3B:72:87:C3)...
 Connected to Mudra Band 43-5381 (F5:FC:3B:72:87:C3), firmware 6.0.9.10
 ```
+
+### Checking that a recording is healthy
+
+If a stream command seems silent, run it with `--debug` and look at stderr:
+
+- No `Connected to ...` line: discovery or the BLE connect is stuck. The debug
+  log shows whether a band known to BlueZ was picked (possibly one that is not
+  in range: pass `--address`) or a scan was done.
+- `no status reply yet`: commands are written but the band does not answer on
+  the COMMAND characteristic.
+- `packets/s: snc=0 imu=0`: connected and subscribed, but the band sends no
+  data. A healthy link shows a steady non-zero rate on each requested stream.
 
 ## Output formats
 

@@ -14,10 +14,32 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 
 from . import __version__
 from .recorder import CSVSink, Decimator, LSLSink, decode_samples
+
+logger = logging.getLogger("mudrarecord.cli")
+
+DEBUG_HELP = (
+    "Log every step to stderr: discovery, connection, GATT services, "
+    "commands sent, status replies, and per-second packet counts. "
+    "Give twice (-dd) to also include bleak's own BlueZ/D-Bus log."
+)
+
+
+def _setup_logging(debug: int) -> None:
+    logging.basicConfig(
+        stream=sys.stderr,
+        format="%(asctime)s.%(msecs)03d %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.WARNING,
+    )
+    if debug >= 1:
+        logging.getLogger("mudrarecord").setLevel(logging.DEBUG)
+    if debug >= 2:
+        logging.getLogger("bleak").setLevel(logging.DEBUG)
 
 
 # --------------------------------------------------------------------------
@@ -37,6 +59,7 @@ def main() -> None:
 
     info_p = sub.add_parser("info", help="Show device info and channel state")
     info_p.add_argument("--address", help="Device address (skip discovery)")
+    info_p.add_argument("-d", "--debug", action="count", default=0, help=DEBUG_HELP)
 
     for name, help_text in [
         ("stream-csv", "Record raw channels to CSV"),
@@ -44,6 +67,7 @@ def main() -> None:
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--address", help="Device address (skip discovery)")
+        p.add_argument("-d", "--debug", action="count", default=0, help=DEBUG_HELP)
         p.add_argument(
             "--rate",
             default="max",
@@ -88,6 +112,7 @@ def main() -> None:
     if args.command is None:
         parser.print_help()
         return
+    _setup_logging(getattr(args, "debug", 0))
 
     try:
         asyncio.run(_dispatch(args))
@@ -118,8 +143,21 @@ async def _get_device(address: str | None):
         match = next((d for d in found if d.address == address), None)
         if match:
             return MudraBand(match)
+        logger.debug("%s not among discovered devices; connecting by address", address)
         return MudraBand.from_address(address)
     return await MudraBand.discover()
+
+
+async def _connect(args):
+    device = await _get_device(args.address)
+    print(f"Connecting to {device.name} ({device.address})...", file=sys.stderr)
+    await device.connect()
+    print(
+        f"Connected to {device.name} ({device.address}), "
+        f"firmware {device.firmware_version or 'unknown'}",
+        file=sys.stderr,
+    )
+    return device
 
 
 # --------------------------------------------------------------------------
@@ -140,8 +178,7 @@ async def _cmd_scan(args) -> None:
 
 
 async def _cmd_info(args) -> None:
-    device = await _get_device(args.address)
-    await device.connect()
+    device = await _connect(args)
     await device.refresh_status()
     await asyncio.sleep(0.3)
 
@@ -191,13 +228,7 @@ async def _cmd_stream(args, mode: str) -> None:
     if not record_snc and not record_imu:
         raise SystemExit("Nothing to record: all channels skipped.")
 
-    device = await _get_device(args.address)
-    await device.connect()
-    print(
-        f"Connected to {device.name} ({device.address}), "
-        f"firmware {device.firmware_version or 'unknown'}",
-        file=sys.stderr,
-    )
+    device = await _connect(args)
 
     # Stop the band from acting as mouse/keyboard.
     await device.disable_hid()
@@ -245,9 +276,16 @@ async def _cmd_stream(args, mode: str) -> None:
     disk_full = {"flag": False}
     # Monotonic time of the last packet seen per stream (for the watchdog).
     last_seen = {"snc": 0.0, "imu": 0.0}
+    # Packets received per stream since the last --debug stats line.
+    received = {"snc": 0, "imu": 0}
+    seen_any: set[str] = set()
 
     def emit(stream: str, ts_ns: int, raw: bytes) -> None:
         last_seen[stream] = loop.time()
+        if stream not in seen_any:
+            seen_any.add(stream)
+            logger.debug("first %s packet (%d bytes): %s", stream, len(raw), raw.hex(" "))
+        received[stream] += 1
         if not decimator.accept(stream):
             return
         try:
@@ -266,6 +304,7 @@ async def _cmd_stream(args, mode: str) -> None:
 
     @device.on_disconnect
     def _on_disc() -> None:
+        print("Device disconnected.", file=sys.stderr)
         loop.call_soon_threadsafe(stop_event.set)
 
     # Report to stderr so stdout can carry CSV.
@@ -319,7 +358,19 @@ async def _cmd_stream(args, mode: str) -> None:
             except Exception as e:
                 print(f"Watchdog re-enable failed: {e}", file=sys.stderr)
 
+    async def stats() -> None:
+        # The SNC packet counter is the quickest check of a healthy link:
+        # the band normally sends tens of packets per second on each stream.
+        while not stop_event.is_set():
+            await asyncio.sleep(1.0)
+            logger.debug(
+                "packets/s: snc=%d imu=%d; records written: %d; connected: %s",
+                received["snc"], received["imu"], sink.count, device.is_connected,
+            )
+            received["snc"] = received["imu"] = 0
+
     wd_task = loop.create_task(watchdog())
+    stats_task = loop.create_task(stats()) if args.debug else None
 
     try:
         await stop_event.wait()
@@ -327,6 +378,8 @@ async def _cmd_stream(args, mode: str) -> None:
         pass
     finally:
         wd_task.cancel()
+        if stats_task:
+            stats_task.cancel()
         await _shutdown(device, sink, args, record_snc, record_acc, record_gyro)
 
 
