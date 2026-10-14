@@ -193,6 +193,11 @@ async def _cmd_stream(args, mode: str) -> None:
 
     device = await _get_device(args.address)
     await device.connect()
+    print(
+        f"Connected to {device.name} ({device.address}), "
+        f"firmware {device.firmware_version or 'unknown'}",
+        file=sys.stderr,
+    )
 
     # Stop the band from acting as mouse/keyboard.
     await device.disable_hid()

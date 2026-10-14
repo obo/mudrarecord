@@ -35,7 +35,7 @@ Created by Ondřej Bojar and Claude Opus 4.8 based on the [Prodilink](https://gi
 Using the included ``live-viewer/live-viewer``, you can create 
 
 ```
-mudrarecord stream-csv \
+python3 -m mudrarecord stream-csv \
 | live-viewer/live-viewer --width=5s \
   --group=snc* --group=rms* --group=a* --shared-range-groups=1,2,3
 ```
@@ -68,6 +68,29 @@ To include LSL output support (`stream-lsl`):
 ```bash
 pip install -e ".[dev,lsl]"
 ```
+
+## Running mudrarecord
+
+All commands in this README are written as
+
+```bash
+python3 -m mudrarecord <command> [options]
+```
+
+which runs the package directly from a checkout, **without installing it**. Run
+it from the repository root (the directory containing the `mudrarecord/`
+package directory), so that Python can find the package. The runtime
+dependencies (`bleak`, and `pylsl` for `stream-lsl`) must be importable by that
+`python3`.
+
+If you installed the package with `pip install .` (see above), pip also puts a
+`mudrarecord` executable on your `PATH`, and `mudrarecord <command> [options]`
+is equivalent to `python3 -m mudrarecord <command> [options]` and works from any
+directory.
+
+`python3 -m mudrarecord --help` lists the commands, and
+`python3 -m mudrarecord <command> --help` lists the options of one command. See
+[Command-line reference](#command-line-reference) below.
 
 ## Connecting to the band
 
@@ -132,15 +155,15 @@ bluetoothctl trust <ADDRESS>
 With the OS link up, confirm mudrarecord can open the GATT layer:
 
 ```bash
-mudrarecord scan          # should list the band (discovery works independently)
-mudrarecord info          # connects, reads firmware/battery/channel state
+python3 -m mudrarecord scan          # should list the band (discovery works independently)
+python3 -m mudrarecord info          # connects, reads firmware/battery/channel state
 ```
 
-- `mudrarecord info` prints device details → the full stack works; you can stream.
-- `mudrarecord info` fails with `Failed to connect ... Operation already in
+- `python3 -m mudrarecord info` prints device details → the full stack works; you can stream.
+- `python3 -m mudrarecord info` fails with `Failed to connect ... Operation already in
   progress` → a BlueZ connect attempt is still pending or stuck. Wait, or reset
   it (see below).
-- `mudrarecord info` fails with an *empty* error message → BlueZ dropped/rejected
+- `python3 -m mudrarecord info` fails with an *empty* error message → BlueZ dropped/rejected
   the connection (band asleep or out of range). Wake the band and retry Step 1.
 
 Tip: pass `--address <ADDRESS>` to `info` / `stream-*` to skip discovery and go
@@ -180,62 +203,125 @@ done
 bluetoothctl info "$ADDR" | grep -Ei 'Paired|Trusted|Connected'
 ```
 
-After a successful re-pair, `mudrarecord scan` will show the band and
-`mudrarecord info` will connect. Note that a re-pair can change the band's BLE
-address; re-run `mudrarecord scan` (or `bluetoothctl devices`) to get the current
+After a successful re-pair, `python3 -m mudrarecord scan` will show the band and
+`python3 -m mudrarecord info` will connect. Note that a re-pair can change the band's BLE
+address; re-run `python3 -m mudrarecord scan` (or `bluetoothctl devices`) to get the current
 one.
 
 ## Usage
 
 ```bash
-mudrarecord scan                         # find nearby bands
-mudrarecord info                         # connect and print device + channel state
+python3 -m mudrarecord scan                         # find nearby bands
+python3 -m mudrarecord info                         # connect and print device + channel state
 
 # Record only the three SNC (sEMG) nerve channels + RMS to a CSV file:
-mudrarecord stream-csv --skip-acc --skip-gyro -o emg.csv
+python3 -m mudrarecord stream-csv --skip-acc --skip-gyro -o emg.csv
 
 # Record everything (SNC + accelerometer) at the device's max rate:
-mudrarecord stream-csv -o recording.csv
+python3 -m mudrarecord stream-csv -o recording.csv
 
 # Also keep the verbatim packet bytes (adds a raw_hex column):
-mudrarecord stream-csv --include-raw-bytes -o with_raw.csv
+python3 -m mudrarecord stream-csv --include-raw-bytes -o with_raw.csv
 
 # Stream to stdout (pipe it somewhere):
-mudrarecord stream-csv -o - | your_consumer
+python3 -m mudrarecord stream-csv -o - | your_consumer
 
 # Publish over LSL for MNE-Python / OpenViBE:
-mudrarecord stream-lsl
+python3 -m mudrarecord stream-lsl
 
 # Keep 1 of every 4 samples (host-side decimation):
-mudrarecord stream-csv --rate 4 -o decimated.csv
+python3 -m mudrarecord stream-csv --rate 4 -o decimated.csv
 
 # Choose the ADC sample type:
-mudrarecord stream-csv --sample-type 24bit -o hires.csv
+python3 -m mudrarecord stream-csv --sample-type 24bit -o hires.csv
 ```
 
 Recording stops on `Ctrl+C`, on device disconnect, or when the output disk is
 full. By default HID stays off after exit; pass `--restore-hid` to turn
 gesture→HID back on when you stop.
 
-### Options common to both stream commands
+## Command-line reference
 
-| Option           | Meaning                                                              |
-|------------------|----------------------------------------------------------------------|
-| `--address ADDR` | Connect to a specific BLE address, skipping discovery.               |
-| `--rate max\|N`  | `max` (default) emits every packet; `N` keeps 1 of every N samples.  |
-| `--sample-type`  | `16bit` or `24bit` ADC sample type (default: leave device unchanged).|
-| `--skip-snc`     | Do not enable/record the SNC (sEMG) stream.                          |
-| `--skip-acc`     | Do not record the accelerometer (see IMU packet note below).        |
-| `--skip-gyro`    | Do not record the gyroscope (see IMU packet note below).            |
-| `--restore-hid`  | Re-enable gesture→HID output on exit.                               |
+```
+python3 -m mudrarecord [-h] [--version] {scan,info,stream-csv,stream-lsl} ...
+```
 
-`stream-csv` additionally has `-o/--output` (file path or `-` for stdout) and
-`--include-raw-bytes` (add a verbatim `raw_hex` column; off by default so the
-CSV contains only decoded values).
+| Global option | Meaning                                   |
+|---------------|-------------------------------------------|
+| `-h, --help`  | Show the list of commands and exit.       |
+| `--version`   | Print the mudrarecord version and exit.   |
+
+Every command also accepts `-h/--help` to print its own options.
+
+### `scan` — find nearby bands
+
+```
+python3 -m mudrarecord scan [--timeout SECONDS]
+```
+
+| Option              | Meaning                                                |
+|---------------------|--------------------------------------------------------|
+| `--timeout SECONDS` | How long to scan for BLE advertisements (default: 10). |
+
+Prints the name and BLE address of every Mudra Band found.
+
+### `info` — print device and channel state
+
+```
+python3 -m mudrarecord info [--address ADDRESS]
+```
+
+| Option              | Meaning                                                                                       |
+|---------------------|-----------------------------------------------------------------------------------------------|
+| `--address ADDRESS` | Connect to the band with this BLE address. Without it, the first band discovered is used.     |
+
+Connects and prints name, address, firmware version, serial number, battery,
+charging state, hand, band mode and which channels / HID routes are enabled.
+
+### `stream-csv` and `stream-lsl` — record
+
+```
+python3 -m mudrarecord stream-csv [--address ADDRESS] [--rate RATE]
+                                  [--sample-type {16bit,24bit}]
+                                  [--skip-snc] [--skip-acc] [--skip-gyro]
+                                  [--restore-hid]
+                                  [-o OUTPUT] [--include-raw-bytes]
+
+python3 -m mudrarecord stream-lsl [--address ADDRESS] [--rate RATE]
+                                  [--sample-type {16bit,24bit}]
+                                  [--skip-snc] [--skip-acc] [--skip-gyro]
+                                  [--restore-hid]
+```
+
+Options of both stream commands:
+
+| Option                        | Meaning                                                                                                   |
+|-------------------------------|-----------------------------------------------------------------------------------------------------------|
+| `--address ADDRESS`           | Connect to the band with this BLE address. Without it, the first band discovered is used.                 |
+| `--rate RATE`                 | `max` (default) emits every sample; an integer `N` keeps 1 of every `N` samples (host-side decimation).   |
+| `--sample-type {16bit,24bit}` | Set the device's ADC sample type. Default: leave the device setting unchanged.                            |
+| `--skip-snc`                  | Do not enable or record the SNC (sEMG) stream.                                                            |
+| `--skip-acc`                  | Do not record the accelerometer (see the IMU packet note below).                                          |
+| `--skip-gyro`                 | Do not record the gyroscope (see the IMU packet note below).                                              |
+| `--restore-hid`               | Re-enable gesture→HID output on exit. Default: HID stays off after mudrarecord exits.                      |
+
+Additional options of `stream-csv` only:
+
+| Option                      | Meaning                                                                                       |
+|-----------------------------|-----------------------------------------------------------------------------------------------|
+| `-o OUTPUT, --output OUTPUT`| Output CSV file path, or `-` for stdout (default: `-`).                                       |
+| `--include-raw-bytes`       | Add a `raw_hex` column with the verbatim BLE packet bytes. Default: only decoded values.      |
 
 Accelerometer and gyroscope are delivered together in a single IMU packet, so
 the IMU stream is only disabled — freeing BLE bandwidth for the remaining
 channels — when **both** `--skip-acc` and `--skip-gyro` are given.
+
+On startup both stream commands print to stderr the band they connected to and
+its firmware version, e.g.
+
+```
+Connected to Mudra Band 43-5381 (F5:FC:3B:72:87:C3), firmware 6.0.9.10
+```
 
 ## Output formats
 
